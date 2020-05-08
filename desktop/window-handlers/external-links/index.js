@@ -3,6 +3,7 @@
 /**
  * External Dependencies
  */
+const { dialog } = require( 'electron' );
 const shell = require( 'electron' ).shell;
 const { URL, format } = require( 'url' );
 
@@ -10,6 +11,9 @@ const { URL, format } = require( 'url' );
  * Internal dependencies
  */
 const Config = require( 'lib/config' );
+const Settings = require( 'lib/settings' );
+const { showMySites } = require( 'lib/calypso-commands' );
+const settingConstants = require( 'lib/settings/constants' );
 const log = require( 'lib/logger' )( 'desktop:external-links' );
 
 /**
@@ -45,8 +49,16 @@ function isValidBrowserUrl( url ) {
 	return false;
 }
 
+function isWpAdminLogin( url ) {
+	const parsedURL = new URL( url );
+	const isWpLogin = parsedURL.pathname.includes( 'wp-login.php' );
+	const isReauth = parsedURL.searchParams ? parsedURL.searchParams.get( 'reauth' ) : null;
+	return isWpLogin && isReauth;
+}
+
 function openInBrowser( event, url ) {
 	if ( isValidBrowserUrl( url ) ) {
+		log.info( `Using system default handler for URL: ${ url }` );
 		shell.openExternal( url );
 	}
 
@@ -64,9 +76,17 @@ function replaceInternalCalypsoUrl( url ) {
 	return url;
 }
 
-module.exports = function( webContents ) {
+module.exports = function( mainWindow ) {
+	const webContents = mainWindow.webContents;
+
 	webContents.on( 'will-navigate', function( event, url ) {
 		const parsedUrl = new URL( url );
+
+		// Handle wp-admin login events from Calypso (i.e. window.location.replace overrides)
+		if ( isWpAdminLogin( url ) ) {
+			log.info( `Ignoring window location override to URL: '${parsedUrl.origin + parsedUrl.pathname}'` );
+			event.preventDefault();
+		}
 
 		for ( let x = 0; x < ALWAYS_OPEN_IN_APP.length; x++ ) {
 			const alwaysOpenUrl = new URL( ALWAYS_OPEN_IN_APP[ x ] );
@@ -76,7 +96,6 @@ module.exports = function( webContents ) {
 			}
 		}
 
-		log.info( `Using system default handler for URL: '${ url }'` );
 		openInBrowser( event, url );
 	} );
 
@@ -103,7 +122,47 @@ module.exports = function( webContents ) {
 
 		const openUrl = format( parsedUrl );
 
-		log.info( `Using system default handler for URL: ${ openUrl }` );
 		openInBrowser( event, openUrl );
+	} );
+
+	webContents.on( 'will-redirect', ( event, url ) => {
+		const parsedURL = new URL( url );
+
+		const promptWpAdminAuth = () => {
+			try {
+				const selected = dialog.showMessageBox( mainWindow, {
+					type: 'info',
+					buttons: [ 'Proceed in Browser', 'Cancel' ],
+					title: 'Jetpack Authorization Required',
+					message: 'This feature requires that Single Sign-On is enabled in the Jetpack settings of the site:' +
+					'\n\n' +
+					`${parsedURL.origin}`,
+					detail: 'You may try again after changing the site\'s Jetpack settings, ' +
+					'or you can proceed in an external browser.'
+				} );
+
+				switch ( selected ) {
+					case 0:
+						log.info( 'User selected \'Proceed in Browser\'...' )
+						openInBrowser( event, url );
+						break;
+					case 1:
+						log.info( 'User selected \'Cancel\'...' );
+						break;
+				}
+				showMySites( mainWindow );
+				// Update last location so redirect isn't automatically triggered on app relaunch
+				Settings.saveSetting( settingConstants.LAST_LOCATION, `/stats/day/${parsedURL.hostname}` );
+			} catch ( error ) {
+				log.error( 'Failed to prompt for Jetpack authorization: ', error );
+			}
+		}
+
+		// Handle external wp-admin login events (e.g. from Jetpack)
+		if ( isWpAdminLogin( url ) ) {
+			// Prevent default navigation regardless of option selected by user.
+			event.preventDefault();
+			promptWpAdminAuth( mainWindow, url );
+		}
 	} );
 };
